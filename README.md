@@ -1,1 +1,3 @@
-# distributionally_robust_rebel
+# DRO–REBEL: Distributionally Robust Relative-Reward Regression for Fast and Efficient LLM Alignment
+
+Standard RLHF algorithms like DPO and PPO fit a single reward model and depend on heuristic tricks (e.g., clipping, value baselines), while recent DRO variants such as WDPO and KLDPO improve robustness but still involve complex updates.  In contrast, DRO–REBEL embeds Wasserstein, KL and χ² uncertainty directly into REBEL’s simple regression‐based update—eliminating extra heuristics—and consistently outperforms DPO, PPO, WDPO and KLDPO in robustness to preference shifts and empirical sample efficiency.
