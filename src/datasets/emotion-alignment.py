@@ -68,7 +68,6 @@ def get_rewards(
     reward_model: AutoModelForSequenceClassification,
     tokenizer: PreTrainedTokenizer,
     texts_list: List[Tuple[str, str]], 
-    label_names: List[str], # Not directly used here, but kept for signature consistency
     alpha_o: float,
     mixing_function_type: str,
     emotion_1_idx: int,

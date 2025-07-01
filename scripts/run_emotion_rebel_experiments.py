@@ -204,7 +204,7 @@ def main():
         "DPO": {**common_dpo_params}, 
         "W-REBEL": {**common_dpo_params, "rho0": W_REBEL_RHO0},
         "KL-REBEL": {**common_dpo_params, "tau": KL_REBEL_TAU}, 
-        "Chi-REBEL": {**common_rebel_params, "rho": CHI2_REBEL_RHO},
+        "CHI-REBEL": {**common_rebel_params, "rho": CHI2_REBEL_RHO},
     }
 
     results = {}
