@@ -3,11 +3,11 @@ import sys
 import torch
 from transformers import GPT2LMHeadModel, AutoModelForSequenceClassification, PreTrainedTokenizer
 from datasets import DatasetDict
-import pandas as pd 
+from typing import Dict
+import pandas as pd
+from tqdm.auto import tqdm
 import random
 import numpy as np
-from tqdm.auto import tqdm
-from collections import Dict
 from datasets import load_dataset
 
 # Add parent directory to path to allow imports from config, models, datasets
@@ -18,10 +18,17 @@ from config import (
     NUM_REBEL_ITERATIONS, NUM_SAMPLES_PER_ITERATION, POLICY_LEARNING_RATE,
     ALPHA_O, MIXING_FUNCTION_TYPE, EMOTION_1_INDEX, EMOTION_2_INDEX,
     W_REBEL_RHO0, KL_REBEL_TAU, CHI2_REBEL_RHO,
-    MAX_SEQ_LENGTH, DEVICE
+    MAX_SEQ_LENGTH, DEVICE,
+    DPO_BETA, DPO_IPO 
 )
 from models.gpt2_models import load_trained_sft_model, load_trained_reward_model, get_tokenizer
-from models.rebel_optimizers import REBELOptimizer, WREBELOptimizer, KLREBELOptimizer, Chi2REBELOptimizer
+from models.rebel_optimizers import (
+    REBELOptimizer, WREBELOptimizer, 
+    KLREBELOptimizer, Chi2REBELOptimizer 
+)
+from models.dpo import (
+    DPOOptimizer, WDPOptimizer, KLDPOptimizer,
+)
 from datasets.data_collection import collect_rebel_data, get_rewards, generate_responses
 
 
@@ -80,26 +87,45 @@ def run_rebel_variant(
     """
     print(f"\n--- Running {variant_name} ---")
 
-    optimizer = None
-    if variant_name == "REBEL":
-        optimizer = REBELOptimizer(
+    optimizer_instance = None
+    if variant_name == "DPO":
+        optimizer_instance = DPOOptimizer(
+            policy_model, ref_policy_model, tokenizer, learning_rate,
+            beta=DPO_BETA, ipo=DPO_IPO,
+            max_seq_length=max_seq_length, device=device
+        )
+    elif variant_name == "WDPO": 
+        optimizer_instance = WDPOptimizer(
+            policy_model, ref_policy_model, tokenizer, learning_rate,
+            beta=DPO_BETA, ipo=DPO_IPO,
+            wdpo_rho=rebel_params["rho0"], 
+            max_seq_length=max_seq_length, device=device
+        )
+    elif variant_name == "KL-DRO": 
+        optimizer_instance = KLDPOptimizer(
+            policy_model, ref_policy_model, tokenizer, learning_rate,
+            beta=DPO_BETA, ipo=DPO_IPO, 
+            tau=rebel_params["tau"], 
+            max_seq_length=max_seq_length, device=device
+        )
+    elif variant_name == "REBEL":
+        optimizer_instance = REBELOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
             eta=rebel_params["eta"], max_seq_length=max_seq_length, device=device
         )
     elif variant_name == "W-REBEL":
-        optimizer = WREBELOptimizer(
+        optimizer_instance = WREBELOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
-            eta=rebel_params["eta"], rho0=rebel_params["rho0"],
-            max_seq_length=max_seq_length, device=device
+            eta=rebel_params["eta"], wrebel_rho=rebel_params["rho0"], max_seq_length=max_seq_length, device=device
         )
     elif variant_name == "KL-REBEL":
-        optimizer = KLREBELOptimizer(
+        optimizer_instance = KLREBELOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
-            eta=rebel_params["eta"], tau=rebel_params["tau"],
+             eta=rebel_params["eta"], tau=rebel_params["tau"],
             max_seq_length=max_seq_length, device=device
         )
     elif variant_name == "Chi-REBEL":
-        optimizer = Chi2REBELOptimizer(
+        optimizer_instance = Chi2REBELOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
             eta=rebel_params["eta"], rho=rebel_params["rho"],
             max_seq_length=max_seq_length, device=device
@@ -120,14 +146,16 @@ def run_rebel_variant(
         if not collected_data:
             print(f"Warning: No data collected in iteration {i}. Skipping update.")
             continue
-
-        loss = optimizer.step(collected_data)
-
-        if (i + 1) % log_interval == 0:
-            pbar.set_postfix({"Loss": f"{loss:.4f}"})
             
-        log_entry = {"iteration": i + 1, "loss": loss}
+        loss_value = optimizer_instance.step(collected_data)
 
+        # 3. Log loss values
+        if (i + 1) % log_interval == 0:
+            pbar.set_postfix({"Loss": f"{loss_value:.4f}"})
+            
+        log_entry = {"iteration": i + 1, "loss": loss_value}
+
+        # 4. Evaluate and log metrics periodically
         if (i + 1) % eval_interval == 0:
             eval_metrics = evaluate_policy(
                 policy_model, reward_model, tokenizer, prompt_dataset,
@@ -136,7 +164,7 @@ def run_rebel_variant(
             )
             log_entry.update(eval_metrics)
             print(f"\n--- {variant_name} Iteration {i+1} ---")
-            print(f"Loss: {loss:.4f}")
+            print(f"Loss: {loss_value:.4f}")
             for metric, value in eval_metrics.items():
                 print(f"{metric}: {value:.4f}")
         
@@ -150,34 +178,39 @@ def main():
 
     os.makedirs("./output", exist_ok=True)
 
-    print(f"Loading SFT model from {OUTPUT_DIR_SFT}...")
     policy_model, policy_tokenizer = load_trained_sft_model(OUTPUT_DIR_SFT, DEVICE)
-    ref_policy_model, _ = load_trained_sft_model(OUTPUT_DIR_SFT, DEVICE) 
+    ref_policy_model, _ = load_trained_sft_model(OUTPUT_DIR_SFT, DEVICE)
 
-    print(f"Loading Reward model from {OUTPUT_DIR_REWARD_MODEL}...")
     reward_model, reward_tokenizer = load_trained_reward_model(OUTPUT_DIR_REWARD_MODEL, DEVICE)
 
-    shared_tokenizer = get_tokenizer(MODEL_NAME) 
+    shared_tokenizer = get_tokenizer(MODEL_NAME)
     
     print("Loading raw emotion dataset for prompts...")
     raw_emotion_dataset = load_dataset("emotion")
 
     common_rebel_params = {
-        "eta": 0.01, 
+        "eta": 0.01,
         "learning_rate": POLICY_LEARNING_RATE
     }
 
-    # Define hyperparameter sets for each variant.
+    common_dpo_params = {
+        "beta": DPO_BETA,
+        "ipo": DPO_IPO,
+        "learning_rate": POLICY_LEARNING_RATE
+    }
+
     rebel_hyperparams = {
         "REBEL": {**common_rebel_params},
-        "W-REBEL": {**common_rebel_params, "rho0": W_REBEL_RHO0},
-        "KL-REBEL": {**common_rebel_params, "tau": KL_REBEL_TAU},
+        "DPO": {**common_dpo_params}, 
+        "W-REBEL": {**common_dpo_params, "rho0": W_REBEL_RHO0},
+        "KL-REBEL": {**common_dpo_params, "tau": KL_REBEL_TAU}, 
         "Chi-REBEL": {**common_rebel_params, "rho": CHI2_REBEL_RHO},
     }
 
     results = {}
 
-    for variant in ["REBEL", "W-REBEL", "KL-REBEL", "Chi-REBEL"]:
+    # Run all variants, including the new DPO ones
+    for variant in ["REBEL", "DPO", "W-REBEL", "KL-REBEL", "Chi-REBEL"]:
         print(f"\nInitializing policy model for {variant}...")
         current_policy_model, _ = load_trained_sft_model(OUTPUT_DIR_SFT, DEVICE)
         
@@ -186,13 +219,13 @@ def main():
             policy_model=current_policy_model,
             ref_policy_model=ref_policy_model,
             reward_model=reward_model,
-            tokenizer=shared_tokenizer, 
+            tokenizer=shared_tokenizer,
             prompt_dataset=raw_emotion_dataset,
             rebel_params=rebel_hyperparams[variant],
             num_iterations=NUM_REBEL_ITERATIONS,
             num_samples_per_iteration=NUM_SAMPLES_PER_ITERATION,
             learning_rate=POLICY_LEARNING_RATE,
-            max_seq_length=MAX_SEQ_LENGTH,
+            max_length=MAX_SEQ_LENGTH,
             device=DEVICE
         )
         results[variant] = variant_results
@@ -201,7 +234,7 @@ def main():
         variant_results.to_csv(output_csv_path, index=False)
         print(f"Results for {variant} saved to {output_csv_path}")
 
-    print("\n--- All REBEL Experiments Complete ---")
-
+    print("\n--- All REBEL/DPO Experiments Complete ---")
+    
 if __name__ == "__main__":
     main()

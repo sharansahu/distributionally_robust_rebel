@@ -32,6 +32,10 @@ W_REBEL_RHO0 = 0.01 # ρ0 for W-REBEL
 KL_REBEL_TAU = 0.1 # τ for KL-REBEL
 CHI2_REBEL_RHO = 0.01 # ρ for Chi^2-REBEL
 
+# DPO Specific Parameters (for WDPO)
+DPO_BETA = 0.1 # Beta parameter for DPO/IPO loss
+DPO_IPO = False # Set to True for IPO-DPO
+
 # --- Device Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

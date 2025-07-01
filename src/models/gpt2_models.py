@@ -1,6 +1,6 @@
 import torch
 from transformers import GPT2LMHeadModel, AutoModelForSequenceClassification, GPT2Tokenizer, AutoTokenizer
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 from typing import Tuple
 
 def get_tokenizer(model_name: str) -> PreTrainedTokenizer:
