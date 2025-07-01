@@ -101,7 +101,7 @@ def run_rebel_variant(
             wdpo_rho=rebel_params["rho0"], 
             max_seq_length=max_seq_length, device=device
         )
-    elif variant_name == "KL-DRO": 
+    elif variant_name == "KL-DPO": 
         optimizer_instance = KLDPOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
             beta=DPO_BETA, ipo=DPO_IPO, 
@@ -124,7 +124,7 @@ def run_rebel_variant(
              eta=rebel_params["eta"], tau=rebel_params["tau"],
             max_seq_length=max_seq_length, device=device
         )
-    elif variant_name == "Chi-REBEL":
+    elif variant_name == "CHI-REBEL":
         optimizer_instance = Chi2REBELOptimizer(
             policy_model, ref_policy_model, tokenizer, learning_rate,
             eta=rebel_params["eta"], rho=rebel_params["rho"],
@@ -209,8 +209,8 @@ def main():
 
     results = {}
 
-    # Run all variants, including the new DPO ones
-    for variant in ["REBEL", "DPO", "W-REBEL", "KL-REBEL", "Chi-REBEL"]:
+    # Run all variants
+    for variant in ["DPO", "WDPO", "KL-DPO", "REBEL", "W-REBEL", "KL-REBEL", "CHI_REBEL"]:
         print(f"\nInitializing policy model for {variant}...")
         current_policy_model, _ = load_trained_sft_model(OUTPUT_DIR_SFT, DEVICE)
         
