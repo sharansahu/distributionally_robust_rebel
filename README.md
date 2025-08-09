@@ -12,10 +12,11 @@ Standard RLHF algorithms like DPO and PPO fit a single reward model and depend o
 
 * [Overview](#overview)
 * [Environment Setup](#environment-setup)
+    * [Quick Start (setup.sh)](#quick-start-setupsh)
+    * [Manual Installation](#manual-installation)
 * [Repo Layout](#repo-layout)
 * [Data](#data)
 * [Core Training Pipelines](#core-training-pipelines)
-
   * [1) Emotion Alignment (SFT → Reward → REBEL/DPO variants)](#1-emotion-alignment-sft--reward--rebeldpo-variants)
   * [2) ArmoRM Multi-Objective Alignment (online scoring)](#2-armorm-multiobjective-alignment-online-scoring)
   * [Optional: Precompute ArmoRM Scores Distributed](#optional-precompute-armorm-scores-distributed)
@@ -47,6 +48,41 @@ Both pipelines share a simple, modular optimizer interface and identical trainin
 
 We recommend a fresh Conda env named `dro-rebel`.
 
+### Quick Start (`scripts/setup.sh`)
+
+One-shot bootstrap that creates the env, installs PyTorch (CUDA or CPU wheels), core deps, optional extras, and writes a default DeepSpeed ZeRO-2 config.
+
+```bash
+# default: auto-detect GPU (uses cu121 wheels if found), creates env "dro-rebel"
+bash scripts/setup.sh
+
+# force CPU wheels
+TORCH_CHANNEL=cpu bash scripts/setup.sh
+
+# force CUDA 12.4 wheels + optional extras
+TORCH_CHANNEL=cu124 INSTALL_FLASH_ATTN=1 INSTALL_BITSANDBYTES=1 bash scripts/setup.sh
+
+# custom conda path/env name
+CONDA_SH=~/miniconda3/etc/profile.d/conda.sh CONDA_ENV=dro-rebel bash scripts/setup.sh
+```
+
+What the script installs:
+
+* `torch`, `torchvision`, `torchaudio` (`cu121|cu124|cpu` wheels)
+* `transformers`, `datasets`, `accelerate`, `deepspeed`, `sentencepiece`, `numpy`, `pandas`, `scikit-learn`, `tqdm`, `pyarrow`
+* Optional: `flash-attn` (if `INSTALL_FLASH_ATTN=1`), `bitsandbytes` (if `INSTALL_BITSANDBYTES=1`)
+* Writes `configs/ds_zero2.json` if missing
+
+**Then authenticate with Hugging Face (for gated models):**
+
+```bash
+huggingface-cli login
+```
+
+---
+
+### Manual Installation
+
 ```bash
 # Create env
 conda create -y -n dro-rebel python=3.10
@@ -62,10 +98,11 @@ pip install transformers datasets accelerate deepspeed tqdm numpy pandas scikit-
 # Optional (FlashAttention2, if your stack supports it)
 # pip install flash-attn --no-build-isolation
 
+# Authenticate with Hugging Face (needed for some models)
 huggingface-cli login
 ```
 
-**GPU guidance.** Experiments were run on 8×H100 (bf16). ZeRO-2 works fine on A100/RTX as well.
+**GPU guidance.** Experiments were run on 8×H100 (bf16). ZeRO-2 works well on A100/RTX as well.
 
 ---
 
