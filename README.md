@@ -22,7 +22,6 @@ Standard RLHF algorithms like DPO and PPO fit a single reward model and depend o
 * [Configuration & Hyperparameters](#configuration--hyperparameters)
 * [Troubleshooting](#troubleshooting)
 * [Citation](#citation)
-* [License](#license)
 * [Acknowledgments](#acknowledgments)
 
 ---
