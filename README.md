@@ -4,6 +4,8 @@
 
 Standard RLHF algorithms like DPO and PPO fit a single reward model and depend on heuristic tricks (e.g., clipping, value baselines), while recent DRO variants such as WDPO and KLDPO improve robustness but still involve complex updates.  In contrast, DRO–REBEL embeds Wasserstein, KL and $\chi^{2}$ uncertainty directly into REBEL’s simple regression‐based update—eliminating extra heuristics—and consistently outperforms DPO, PPO, WDPO and KLDPO in robustness to preference shifts and empirical sample efficiency.
 
+![DRO-REBEL](./figures/DRO-REBEL-figure-2.png)
+
 ---
 
 ## Contents
