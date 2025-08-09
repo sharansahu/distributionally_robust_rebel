@@ -1,7 +1,14 @@
 import torch
 from transformers import GPT2LMHeadModel, PreTrainedTokenizer
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from utils import get_log_probs_and_input_embeddings
+import deepspeed
+import torch.distributed as dist
+from typing import Optional, Union
+from dist_utils import is_dist_initialized
+from dist_utils import global_mean
+from dist_utils import all_gather_concat_1d
+
 
 def compute_rebel_loss_fn(
     log_prob_a1_new: torch.Tensor, # log pi_theta(a1|x)
@@ -27,11 +34,41 @@ def compute_rebel_loss_fn(
     losses = (regression_term - reward_diff)**2
     return losses
 
+def rebel_pointwise_losses(
+    model_fw,
+    tokenizer,
+    prompts,
+    responses_a1,
+    responses_a2,
+    rewards_a1,
+    rewards_a2,
+    log_prob_ref_a1,
+    log_prob_ref_a2,
+    max_seq_length,
+    device,
+    eta: float,
+    require_emb_grads: bool = False,
+) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+    log_prob_a1_new, emb_a1 = get_log_probs_and_input_embeddings(
+        model_fw, tokenizer, prompts, responses_a1, max_seq_length, device, requires_grad=require_emb_grads
+    )
+    log_prob_a2_new, emb_a2 = get_log_probs_and_input_embeddings(
+        model_fw, tokenizer, prompts, responses_a2, max_seq_length, device, requires_grad=require_emb_grads
+    )
+    losses = compute_rebel_loss_fn(
+        log_prob_a1_new, log_prob_a2_new,
+        log_prob_ref_a1, log_prob_ref_a2,
+        rewards_a1, rewards_a2,
+        eta
+    )
+    return losses, emb_a1, emb_a2
 
 class BasePolicyOptimizer:
     """
     Base class for policy optimizers (REBEL, KL-REBEL, Chi-REBEL).
-    Manages common setup like model, tokenizer, optimizer, and basic step logic.
+    Manages common setup like model, tokenizer, optimizer, and basic step logic. 
+    If deepspeed_config is provided (dict or path), we wrap the policy
+    with DeepSpeed ZeRO-2; otherwise we fall back to single-GPU AdamW.
     """
     def __init__(
         self,
@@ -41,44 +78,54 @@ class BasePolicyOptimizer:
         learning_rate: float,
         eta: float,
         max_seq_length: int,
-        device: torch.device
+        device: torch.device,
+        deepspeed_config: Optional[Union[str, dict]] = None,
     ):
-        self.policy_model = policy_model
-        self.ref_policy_model = ref_policy_model
         self.tokenizer = tokenizer
-        self.optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
         self.eta = eta
         self.max_seq_length = max_seq_length
         self.device = device
 
-    def step(self, batch_data: List[Dict[str, Any]]) -> float:
-        self.policy_model.train()
-        self.optimizer.zero_grad()
+        self.ref_policy_model = ref_policy_model.to(device)
+        self._ds_engine = None
+        self.scheduler = None
 
-        prompts = [d["prompt"] for d in batch_data]
-        responses_a1 = [d["response_a1"] for d in batch_data]
-        responses_a2 = [d["response_a2"] for d in batch_data]
-        rewards_a1 = torch.tensor([d["reward_a1"] for d in batch_data], device=self.device, dtype=torch.float32)
-        rewards_a2 = torch.tensor([d["reward_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
-        log_prob_ref_a1 = torch.tensor([d["log_prob_ref_a1"] for d in batch_data], device=self.device, dtype=torch.float32)
-        log_prob_ref_a2 = torch.tensor([d["log_prob_ref_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
+        if deepspeed_config is not None:
+            # Let DeepSpeed handle optimizer/scheduler/AMP/ZeRO-2
+            self._ds_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=policy_model,
+                model_parameters=policy_model.parameters(),
+                config=deepspeed_config
+            )
+            self.policy_model = self._ds_engine
+        else:
+            # Fallback: vanilla AdamW on single GPU
+            self.policy_model = policy_model.to(device)
+            self.optimizer = torch.optim.AdamW(self.policy_model.parameters(), lr=learning_rate)
 
-        log_prob_a1_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False)
-        log_prob_a2_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
+        # ensure ref_policy is eval/frozen
+        for p in self.ref_policy_model.parameters():
+            p.requires_grad_(False)
+        self.ref_policy_model.eval()
 
-        individual_losses = compute_rebel_loss_fn(
-            log_prob_a1_new, log_prob_a2_new,
-            log_prob_ref_a1, log_prob_ref_a2,
-            rewards_a1, rewards_a2,
-            self.eta
-        )
-        loss = torch.mean(individual_losses)
+        if deepspeed_config is not None and not is_dist_initialized():
+            # DS usually initializes the process group via launcher; this is just a guard.
+            dist.init_process_group(backend="nccl")
 
-        loss.backward()
-        self.optimizer.step()
+    def _model_for_fw(self):
+        """Return the nn.Module used for forward (unwrap DS engine if needed)."""
+        if hasattr(self.policy_model, "module"):
+            return self.policy_model.module
+        return self.policy_model
 
-        return loss.item()
-
+    def _backward_and_step(self, loss: torch.Tensor):
+        if hasattr(self.policy_model, "backward") and hasattr(self.policy_model, "step"):
+            self.policy_model.backward(loss)
+            self.policy_model.step()
+        else:
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self.optimizer.step()
 
 class REBELOptimizer(BasePolicyOptimizer):
     def __init__(
@@ -143,8 +190,9 @@ class WREBELOptimizer(BasePolicyOptimizer):
         self.rho0 = rho0
 
     def step(self, batch_data: List[Dict[str, Any]]) -> float:
-        self.policy_model.train()
-        self.optimizer.zero_grad()
+        model_fw = self._model_for_fw()
+        if hasattr(self.policy_model, "train"):
+            self.policy_model.train()
 
         prompts = [d["prompt"] for d in batch_data]
         responses_a1 = [d["response_a1"] for d in batch_data]
@@ -153,66 +201,40 @@ class WREBELOptimizer(BasePolicyOptimizer):
         rewards_a2 = torch.tensor([d["reward_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
         log_prob_ref_a1 = torch.tensor([d["log_prob_ref_a1"] for d in batch_data], device=self.device, dtype=torch.float32)
         log_prob_ref_a2 = torch.tensor([d["log_prob_ref_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
-        
-        individual_losses = []
+
+        # pointwise REBEL + track embedding grads
+        ell_i, emb_a1, emb_a2 = rebel_pointwise_losses(
+            model_fw, self.tokenizer, prompts, responses_a1, responses_a2,
+            rewards_a1, rewards_a2, log_prob_ref_a1, log_prob_ref_a2,
+            self.max_seq_length, self.device, self.eta, require_emb_grads=True
+        )
+
+        # gradient penalty on input embeddings, per-sample (WD trick)
         grad_norms_sq = []
-
-        for i in range(len(prompts)):
-            self.policy_model.zero_grad()
-
-            current_prompt = prompts[i]
-            current_response_a1 = responses_a1[i]
-            current_response_a2 = responses_a2[i]
-
-            log_prob_a1_new_i, logits_a1_for_grad = get_log_probs_and_input_embeddings(
-                self.policy_model, self.tokenizer, [current_prompt], [current_response_a1],
-                self.max_seq_length, self.device
-            )
-            log_prob_a2_new_i, logits_a2_for_grad = get_log_probs_and_input_embeddings(
-                self.policy_model, self.tokenizer, [current_prompt], [current_response_a2],
-                self.max_seq_length, self.device
-            )
-
-            if not logits_a1_for_grad or not logits_a2_for_grad:
-                # Handle cases where response is too short or empty (log_prob might be 0)
-                # Skip this sample for gradient regularization if there are no logits to differentiate wrt
+        for i in range(len(ell_i)):
+            cur_embs = []
+            if emb_a1[i].numel() > 0: cur_embs.append(emb_a1[i])
+            if emb_a2[i].numel() > 0: cur_embs.append(emb_a2[i])
+            if not cur_embs:
+                grad_norms_sq.append(ell_i.new_zeros(()))
                 continue
-
-            log_prob_a1_new_scalar = log_prob_a1_new_i.squeeze(0)
-            log_prob_a2_new_scalar = log_prob_a2_new_i.squeeze(0)
-            
-            log_prob_ref_a1_scalar = log_prob_ref_a1[i]
-            log_prob_ref_a2_scalar = log_prob_ref_a2[i]
-
-            loss_i = compute_rebel_loss_fn(
-                log_prob_a1_new_scalar.unsqueeze(0), log_prob_a2_new_scalar.unsqueeze(0), 
-                log_prob_ref_a1_scalar.unsqueeze(0), log_prob_ref_a2_scalar.unsqueeze(0),
-                rewards_a1[i].unsqueeze(0), rewards_a2[i].unsqueeze(0),
-                self.eta
+            grads = torch.autograd.grad(
+                outputs=ell_i[i],
+                inputs=cur_embs,
+                grad_outputs=torch.ones_like(ell_i[i]),
+                create_graph=True,
+                retain_graph=True
             )
-            individual_losses.append(loss_i)
+            gn2 = sum(g.pow(2).sum() for g in grads if g is not None)
+            grad_norms_sq.append(gn2)
 
-            loss_i.backward(retain_graph=True) 
+        grad_norms_sq = torch.stack(grad_norms_sq) if len(grad_norms_sq) else ell_i.new_zeros((1,))
+        # R(pi)=rho0 * sqrt(E ||∇_z l||^2 )  (use the tractable per-sample version)
+        R_term = self.rho0 * torch.sqrt(grad_norms_sq.mean().clamp_min(0.0))
 
-            grad_logits_a1 = logits_a1_for_grad[0].grad if logits_a1_for_grad[0].grad is not None else torch.zeros_like(logits_a1_for_grad[0])
-            grad_logits_a2 = logits_a2_for_grad[0].grad if logits_a2_for_grad[0].grad is not None else torch.zeros_like(logits_a2_for_grad[0])
-
-            grad_norm_sq_i = (grad_logits_a1**2).sum() + (grad_logits_a2**2).sum()
-            grad_norms_sq.append(grad_norm_sq_i)
-        
-        if grad_norms_sq:
-            R_term = self.rho0 * torch.sqrt(torch.mean(torch.stack(grad_norms_sq)))
-        else:
-            R_term = torch.tensor(0.0, device=self.device) # No samples to calculate grad for
-
-        # Total approximate WD-REBEL loss
-        total_rebel_loss = torch.mean(torch.stack(individual_losses)) if individual_losses else torch.tensor(0.0, device=self.device)
-        total_loss = total_rebel_loss + R_term
-
-        total_loss.backward()
-        self.optimizer.step()
-
-        return total_loss.item()
+        total_loss = ell_i.mean() + R_term
+        self._backward_and_step(total_loss)
+        return total_loss.detach().item()
 
 
 class KLREBELOptimizer(BasePolicyOptimizer):
@@ -231,8 +253,9 @@ class KLREBELOptimizer(BasePolicyOptimizer):
         self.tau = tau
 
     def step(self, batch_data: List[Dict[str, Any]]) -> float:
-        self.policy_model.train()
-        self.optimizer.zero_grad()
+        model_fw = self._model_for_fw()
+        if hasattr(self.policy_model, "train"):  # DS engine also has .train()
+            self.policy_model.train()
 
         prompts = [d["prompt"] for d in batch_data]
         responses_a1 = [d["response_a1"] for d in batch_data]
@@ -242,28 +265,27 @@ class KLREBELOptimizer(BasePolicyOptimizer):
         log_prob_ref_a1 = torch.tensor([d["log_prob_ref_a1"] for d in batch_data], device=self.device, dtype=torch.float32)
         log_prob_ref_a2 = torch.tensor([d["log_prob_ref_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
 
-        log_prob_a1_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False)
-        log_prob_a2_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
-        
+        log_prob_a1_new, _ = get_log_probs_and_input_embeddings(model_fw, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False)
+        log_prob_a2_new, _ = get_log_probs_and_input_embeddings(model_fw, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
+
         individual_ell_losses = compute_rebel_loss_fn(
             log_prob_a1_new, log_prob_a2_new,
             log_prob_ref_a1, log_prob_ref_a2,
             rewards_a1, rewards_a2,
             self.eta
-        )
+        )  # (local_bs,)
 
-        mean_ell = torch.mean(individual_ell_losses)
+        # Use global mean across all ranks:
+        mean_ell_global = global_mean(individual_ell_losses)
+
         tau_effective = max(self.tau, 1e-6)
-
-        tilde_P_i = torch.exp((1 / tau_effective) * (individual_ell_losses - mean_ell))
-        P_i = tilde_P_i / torch.sum(tilde_P_i)
+        tilde_P_i = torch.exp((1.0 / tau_effective) * (individual_ell_losses - mean_ell_global))
+        P_i = tilde_P_i / tilde_P_i.sum().clamp_min(1e-12)
 
         loss = torch.sum(P_i * individual_ell_losses)
 
-        loss.backward()
-        self.optimizer.step()
-
-        return loss.item()
+        self._backward_and_step(loss)
+        return loss.detach().item()
 
 
 class Chi2REBELOptimizer(BasePolicyOptimizer):
@@ -281,49 +303,32 @@ class Chi2REBELOptimizer(BasePolicyOptimizer):
         super().__init__(policy_model, ref_policy_model, tokenizer, learning_rate, eta, max_seq_length, device)
         self.rho = rho
 
-    def _find_eta_star(self, ell_losses: torch.Tensor) -> float:
-        if ell_losses.numel() == 0:
+    def _find_eta_star_global(self, global_losses: torch.Tensor) -> float:
+        if global_losses.numel() == 0:
             return 0.0
-
-        sorted_ell_losses, _ = torch.sort(ell_losses)
-        n = len(ell_losses)
-        
-        min_val = float('inf')
-        eta_star = None
-
-        candidate_etas = torch.unique(sorted_ell_losses)
-        
-        if candidate_etas.numel() > 0:
-            candidate_etas = torch.cat([
-                candidate_etas.min().unsqueeze(0) - 1.0,
-                candidate_etas,
-                candidate_etas.max().unsqueeze(0) + 1.0
-            ]).to(self.device)
+        sorted_ell, _ = torch.sort(global_losses)
+        # candidate set = {min-1, uniques, max+1}
+        uniq = torch.unique(sorted_ell)
+        device = global_losses.device
+        if uniq.numel() > 0:
+            cand = torch.cat([uniq.min().unsqueeze(0) - 1.0, uniq, uniq.max().unsqueeze(0) + 1.0]).to(device)
         else:
-            candidate_etas = torch.tensor([0.0], device=self.device)
+            cand = torch.tensor([0.0], device=device)
 
-        for eta_cand in candidate_etas:
-            if n == 0 or self.rho == 0:
-                current_val = eta_cand.item()
-                if current_val < min_val:
-                    min_val = current_val
-                    eta_star = eta_cand.item()
-                continue
-            
-            term = (ell_losses - eta_cand).clamp(min=0)**2
-            sum_term = term.sum()
-
-            current_val = eta_cand + torch.sqrt((2 * self.rho / n) * sum_term)
-            if current_val < min_val:
-                min_val = current_val
-                eta_star = eta_cand.item()
-
+        n = global_losses.numel()
+        best_val, eta_star = float("inf"), 0.0
+        for eta_c in cand:
+            term = (global_losses - eta_c).clamp(min=0.0).pow(2).sum()
+            cur = eta_c + torch.sqrt((2.0 * self.rho / max(n,1)) * term)
+            if cur.item() < best_val:
+                best_val = cur.item()
+                eta_star = eta_c.item()
         return eta_star
 
-
     def step(self, batch_data: List[Dict[str, Any]]) -> float:
-        self.policy_model.train()
-        self.optimizer.zero_grad()
+        model_fw = self._model_for_fw()
+        if hasattr(self.policy_model, "train"):
+            self.policy_model.train()
 
         prompts = [d["prompt"] for d in batch_data]
         responses_a1 = [d["response_a1"] for d in batch_data]
@@ -333,59 +338,45 @@ class Chi2REBELOptimizer(BasePolicyOptimizer):
         log_prob_ref_a1 = torch.tensor([d["log_prob_ref_a1"] for d in batch_data], device=self.device, dtype=torch.float32)
         log_prob_ref_a2 = torch.tensor([d["log_prob_ref_a2"] for d in batch_data], device=self.device, dtype=torch.float32)
 
-        log_prob_a1_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False)
-        log_prob_a2_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
-        
-        individual_ell_losses = compute_rebel_loss_fn(
+        # local losses
+        log_prob_a1_new, _ = get_log_probs_and_input_embeddings(model_fw, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False)
+        log_prob_a2_new, _ = get_log_probs_and_input_embeddings(model_fw, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
+
+        local_losses = compute_rebel_loss_fn(
             log_prob_a1_new, log_prob_a2_new,
             log_prob_ref_a1, log_prob_ref_a2,
             rewards_a1, rewards_a2,
             self.eta
-        )
-        
-        eta_star = self._find_eta_star(individual_ell_losses.detach())
+        )  # shape (local_bs,)
 
-        n = len(individual_ell_losses)
-        lambda_star_denom = (individual_ell_losses - eta_star).clamp(min=0)**2
-        lambda_star_denom_sum = lambda_star_denom.sum()
-        
-        if n == 0 or self.rho == 0 or lambda_star_denom_sum.item() == 0:
-            lambda_star = torch.tensor(1e-6, device=self.device)
+        # gather to global vector
+        global_losses = all_gather_concat_1d(local_losses.detach())
+
+        # solve global eta*
+        eta_star = self._find_eta_star_global(global_losses)
+
+        # derive lambda*, requires global sum of (loss-eta)_+^2
+        n_total = global_losses.numel()
+        # local sum
+        local_sq = (local_losses - eta_star).clamp(min=0.0).pow(2).sum()
+        # global sum
+        from dist_utils import all_reduce_sum
+        global_sq = all_reduce_sum(local_sq.clone())
+
+        if n_total == 0 or self.rho == 0 or global_sq.item() == 0:
+            lambda_star = local_losses.new_tensor(1e-6)
         else:
-            lambda_star = torch.sqrt((2 * self.rho / n) * lambda_star_denom_sum)
-            lambda_star = max(lambda_star, torch.tensor(1e-6, device=self.device))
+            lambda_star = torch.sqrt((2.0 * self.rho / float(n_total)) * global_sq).clamp_min(1e-6)
 
-        w_i = (individual_ell_losses - eta_star).clamp(min=0) / (n * lambda_star)
+        # weights for *local* samples
+        w_i = (local_losses - eta_star).clamp(min=0.0) / lambda_star
+        w_i = w_i / max(n_total, 1)  # note: definition used 1/(n * λ*)
 
-        total_robust_gradient = None
-        for i in range(len(prompts)):
-            grad_ell_i = torch.autograd.grad(
-                individual_ell_losses[i],
-                self.policy_model.parameters(),
-                retain_graph=True,
-                allow_unused=True
-            )
+        # final scalar loss = sum_i w_i * loss_i  (single backward is ZeRO-safe)
+        loss = torch.sum(w_i * local_losses)
 
-            if total_robust_gradient is None:
-                total_robust_gradient = [w_i[i] * g_val if g_val is not None else None for g_val in grad_ell_i]
-            else:
-                for j, g_val in enumerate(grad_ell_i):
-                    if g_val is not None:
-                        if total_robust_gradient[j] is None:
-                            total_robust_gradient[j] = w_i[i] * g_val
-                        else:
-                            total_robust_gradient[j] += w_i[i] * g_val
+        self._backward_and_step(loss)
 
-        if total_robust_gradient:
-            for param, grad in zip(self.policy_model.parameters(), total_robust_gradient):
-                if param.grad is None:
-                    param.grad = grad
-                else:
-                    if grad is not None:
-                        param.grad += grad
-        
-        self.optimizer.step()
-        
-        final_loss_val = eta_star + torch.sqrt((2 * self.rho / n) * (individual_ell_losses - eta_star).clamp(min=0)**2).sum().item()
-        
-        return final_loss_val
+        # Optional reporting: the robust objective value
+        rob_val = (local_losses.new_tensor(eta_star) + torch.sqrt((2.0 * self.rho / float(n_total)) * global_sq)).item()
+        return rob_val

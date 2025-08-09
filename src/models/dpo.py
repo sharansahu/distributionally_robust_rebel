@@ -3,6 +3,7 @@ import torch.nn as nn
 from transformers import GPT2LMHeadModel, PreTrainedTokenizer
 from typing import List, Dict, Any
 import torch.nn.functional as F
+from dist_utils import global_mean
 
 from utils import get_log_probs_and_input_embeddings
 
@@ -287,29 +288,25 @@ class KLDPOptimizer:
         log_prob_a2_new, _ = get_log_probs_and_input_embeddings(self.policy_model, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False)
 
         with torch.no_grad():
-            log_prob_a1_ref, _ = get_log_probs_and_input_embeddings(self.ref_policy_model, self.tokenizer, prompts, responses_a1, self.max_length, self.device, requires_grad=False)
-            log_prob_a2_ref, _ = get_log_probs_and_input_embeddings(self.ref_policy_model, self.tokenizer, prompts, responses_a2, self.max_length, self.device, requires_grad=False)
+            log_prob_a1_ref, _ = get_log_probs_and_input_embeddings(
+                self.ref_policy_model, self.tokenizer, prompts, responses_a1, self.max_seq_length, self.device, requires_grad=False
+            )
+            log_prob_a2_ref, _ = get_log_probs_and_input_embeddings(
+                self.ref_policy_model, self.tokenizer, prompts, responses_a2, self.max_seq_length, self.device, requires_grad=False
+            )
 
-        individual_dpo_losses = self.base_dpo_loss_fn(
-            log_prob_a1_new, log_prob_a2_new,
-            log_prob_a1_ref, log_prob_a2_ref,
-            preference
-        ) # (batch_size,)
+        individual_dpo_losses = self.loss_fn(
+            log_prob_a1_new, log_prob_a2_new, log_prob_a1_ref, log_prob_a2_ref, preference
+        )
 
-        # Approximate the worst-case weights P(i)
-        mean_ell = torch.mean(individual_dpo_losses)
-        tau_effective = max(self.tau, 1e-6) # Guard against zero tau
+        mean_ell_global = global_mean(individual_dpo_losses)
+        tau_effective = max(self.tau, 1e-6)
+        tilde_P_i = torch.exp((1.0 / tau_effective) * (individual_dpo_losses - mean_ell_global))
+        P_i = tilde_P_i / tilde_P_i.sum().clamp_min(1e-12)
 
-        # P(i) proportional to exp((1/tau)(l(z_i; theta) - (1/n) sum l(z_j; theta)))
-        tilde_P_i = torch.exp((1 / tau_effective) * (individual_dpo_losses - mean_ell))
-
-        # Normalize weights
-        P_i = tilde_P_i / torch.sum(tilde_P_i) 
-
-        # Calculate the approximate KLDPO loss: sum( P(i) * l(z_i; theta) )
         loss = torch.sum(P_i * individual_dpo_losses)
 
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
-
-        return loss.item()
+        return loss.detach().item()
