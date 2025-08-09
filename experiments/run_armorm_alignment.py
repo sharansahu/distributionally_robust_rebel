@@ -15,7 +15,6 @@ from transformers import (
     PreTrainedTokenizer,
 )
 
-# repo-local imports (expect these to exist in your codebase)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils import get_log_probs_and_input_embeddings
 from models.rebel_optimizers import REBELOptimizer, WREBELOptimizer, KLREBELOptimizer, Chi2REBELOptimizer
