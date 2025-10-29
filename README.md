@@ -341,9 +341,14 @@ If you use this repository, please cite **ArmoRM** and related work as applicabl
       url={https://arxiv.org/abs/2502.01930}, 
 }
 
-@article{sahudro,
-  title={DRO--REBEL: Distributionally Robust Relative-Reward Regression for Fast and Efficient LLM Alignment},
-  author={Sahu, Sharan}
+@misc{sahu2025drorebeldistributionallyrobustrelativereward,
+      title={DRO-REBEL: Distributionally Robust Relative-Reward Regression for Fast and Efficient LLM Alignment}, 
+      author={Sharan Sahu and Martin T. Wells},
+      year={2025},
+      eprint={2509.19104},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.19104}, 
 }
 
 @inproceedings{ArmoRM,
